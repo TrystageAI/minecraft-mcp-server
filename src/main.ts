@@ -13,10 +13,13 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder') as any
 import { Vec3 } from 'vec3';
 import { startAutoFight, stopAutoFight, getAutoFightStatus } from './autofight.js';
 
+import { parseConfig } from './config.js';
+
+const cliConfig = parseConfig();
 const CONFIG = {
-  host: process.env.MC_HOST || 'play.mcsrv.cn',
-  port: parseInt(process.env.MC_PORT || '19132'),
-  username: process.env.MC_USER || 'Flux',
+  host: cliConfig.host,
+  port: cliConfig.port,
+  username: cliConfig.username,
   password: process.env.MC_PASS || '',
   auth: (process.env.MC_AUTH || 'offline') as 'offline' | 'mojang' | 'microsoft',
   bedrock: process.env.MC_BEDROCK === 'true',
