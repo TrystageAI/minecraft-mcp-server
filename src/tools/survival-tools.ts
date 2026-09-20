@@ -1,12 +1,13 @@
 import { z } from "zod";
-import mineflayer from 'mineflayer';
+import { Bot } from 'mineflayer';
+import type { Block } from 'prismarine-block';
+import { Vec3 } from 'vec3';
 import { ToolFactory } from '../tool-factory.js';
-import { AutoFight } from '../autofight.js';
 import { EventBuffer } from '../event-buffer.js';
 
 interface SurvivalContext {
-  getBot: () => mineflayer.Bot;
-  getAutoFight: () => AutoFight | null;
+  getBot: () => Bot;
+  getAutoFight: () => { enable(): void; disable(): void; isEnabled(): boolean } | null;
   getEventBuffer: () => EventBuffer;
 }
 
@@ -51,32 +52,32 @@ export function registerSurvivalTools(factory: ToolFactory, ctx: SurvivalContext
 
       // Health / food
       const health = Math.round((bot.health ?? 20) * 10) / 10;
-      const food = bot.foodLevel ?? 20;
-      const sat = bot.foodSaturationLevel ?? 0;
+      const food = bot.food ?? 20;
+      const sat = (bot as any).foodSaturationLevel ?? 0;
 
       // Time / biome
-      const gameDay = bot.time % 24000;
+      const gameDay = (bot as any).time % 24000;
       const isDay = gameDay >= 0 && gameDay < 13000;
       const isNight = gameDay >= 13000 && gameDay < 23000;
       const timeStr = isDay ? 'day' : isNight ? 'night' : 'twilight';
 
-      const biome = bot.biome?.name?.replace(/minecraft:/, '') || 'unknown';
+      const biome = (bot as any).biome?.name?.replace(/minecraft:/, '') || 'unknown';
 
       // Surrounding blocks (lightweight: 5x3x5 cross)
       const blocks: string[] = [];
       const cx = pos.x, cy = pos.y, cz = pos.z;
       // Ground
-      const ground = bot.blockAt(entity.position.below());
+      const ground = bot.blockAt(entity.position.clone().add(new Vec3(0, -1, 0)));
       // Above head
       const head = bot.blockAt(entity.position);
       // In front (2 blocks)
-      const ahead1 = bot.blockAt(entity.position.offset(0, 0, 1));
-      const ahead2 = bot.blockAt(entity.position.offset(0, 0, 2));
+      const ahead1 = bot.blockAt(entity.position.clone().add(new Vec3(0, 0, 1)));
+      const ahead2 = bot.blockAt(entity.position.clone().add(new Vec3(0, 0, 2)));
       // Left/Right (1 block)
-      const left = bot.blockAt(entity.position.offset(-1, 0, 0));
-      const right = bot.blockAt(entity.position.offset(1, 0, 0));
+      const left = bot.blockAt(entity.position.clone().add(new Vec3(-1, 0, 0)));
+      const right = bot.blockAt(entity.position.clone().add(new Vec3(1, 0, 0)));
 
-      const blockName = (b: mineflayer.Block | null | undefined) =>
+      const blockName = (b: Block | null | undefined) =>
         b ? b.name.replace('minecraft:', '') : 'air';
 
       const scene: Record<string, unknown> = {
@@ -93,10 +94,12 @@ export function registerSurvivalTools(factory: ToolFactory, ctx: SurvivalContext
       };
 
       // Nearby entities (within 8 blocks)
-      const nearby = bot.nearestEntities().filter(e => {
+      const allEntities = Object.values(bot.entities) as any[];
+      const nearby = allEntities.filter(e => {
         if (e === entity) return false;
-        const d = e.position?.distanceTo(entity.position);
-        return d !== undefined && d < 8;
+        if (!e.position) return false;
+        const d = e.position.distanceTo(entity.position);
+        return d < 8;
       });
 
       if (nearby.length > 0) {
