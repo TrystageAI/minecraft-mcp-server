@@ -8,6 +8,8 @@ import { parseConfig } from './config.js';
 import { BotConnection } from './bot-connection.js';
 import { ToolFactory } from './tool-factory.js';
 import { MessageStore } from './message-store.js';
+import { EventBuffer } from './event-buffer.js';
+import { AutoFight } from './autofight.js';
 import { registerPositionTools } from './tools/position-tools.js';
 import { registerInventoryTools } from './tools/inventory-tools.js';
 import { registerBlockTools } from './tools/block-tools.js';
@@ -17,6 +19,7 @@ import { registerFlightTools } from './tools/flight-tools.js';
 import { registerGameStateTools } from './tools/gamestate-tools.js';
 import { registerCraftingTools } from './tools/crafting-tools.js';
 import { registerFurnaceTools } from './tools/furnace-tools.js';
+import { registerSurvivalTools } from './tools/survival-tools.js';
 
 setupStdioFiltering();
 
@@ -31,6 +34,8 @@ process.on('uncaughtException', (error) => {
 async function main() {
   const config = parseConfig();
   const messageStore = new MessageStore();
+  const eventBuffer = new EventBuffer();
+  let autofight: AutoFight | null = null;
 
   const connection = new BotConnection(
     config,
@@ -41,6 +46,36 @@ async function main() {
   );
 
   connection.connect();
+
+  // Wire up event buffer hooks on the bot
+  const bot = connection.getBot()!;
+  if (bot) {
+    bot.on('health', () => {
+      autofight?.checkRetreatRecovery();
+    });
+    bot.on('death', () => {
+      eventBuffer.push('death', 'Bot died!', true);
+    });
+    bot.on('itemDrop', (_entity, droppedItem) => {
+      // itemDrop fires when we lose an item on death
+      eventBuffer.push('info', `dropped ${droppedItem.name}`, false);
+    });
+    bot.on('collect', (item, collector) => {
+      if (collector === bot) {
+        eventBuffer.push('pickup', `pickup: ${item.name}`, false);
+      }
+    });
+    bot.on('hit', (_entity, _damage) => {
+      eventBuffer.push('damage', 'took damage', true);
+    });
+    bot.on('hurt', (damage, _cause) => {
+      eventBuffer.push('damage', `-${damage} HP`, damage > 4);
+    });
+    bot.on('spawn', () => {
+      autofight = new AutoFight(bot, eventBuffer);
+      log('info', 'AutoFight module initialized');
+    });
+  }
 
   const server = new McpServer({
     name: "minecraft-mcp-server",
@@ -59,8 +94,14 @@ async function main() {
   registerGameStateTools(factory, getBot);
   registerCraftingTools(factory, getBot);
   registerFurnaceTools(factory, getBot);
+  registerSurvivalTools(factory, {
+    getBot,
+    getAutoFight: () => autofight,
+    getEventBuffer: () => eventBuffer,
+  });
 
   process.stdin.on('end', () => {
+    autofight?.destroy();
     connection.cleanup();
     log('info', 'MCP Client has disconnected. Shutting down...');
     process.exit(0);
