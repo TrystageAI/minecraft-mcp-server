@@ -139,18 +139,35 @@ registerTool(
     const goal = new goals.GoalNear(x, y, z, 2);
     return new Promise((resolve) => {
       const b = bot!;
-      b.pathfinder.setGoal(goal);
-      b.pathfinder.once('goal_reached', () => {
+      let done = false;
+
+      const onGoalReached = () => {
+        if (done) return;
+        done = true;
+        clearInterval(checkRepath);
+        clearTimeout(timer);
         resolve({ success: true, position: b.entity.position });
-      });
+      };
+
+      b.once('goal_reached', onGoalReached);
+      b.pathfinder.setGoal(goal);
+
       const checkRepath = setInterval(() => {
-        if (b.pathfinder.repathCount > 10) {
+        if ((b as any).pathfinder.repathCount > 10) {
+          if (done) return;
+          done = true;
           clearInterval(checkRepath);
+          clearTimeout(timer);
+          b.off('goal_reached', onGoalReached);
           resolve({ success: false, reason: 'Too many repaths' });
         }
       }, 1000);
-      setTimeout(() => {
+
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
         clearInterval(checkRepath);
+        b.off('goal_reached', onGoalReached);
         resolve({ success: false, reason: 'Timeout' });
       }, 30000);
     });
