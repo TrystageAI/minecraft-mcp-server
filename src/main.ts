@@ -746,41 +746,62 @@ registerTool(
       return { error: `Target position is not air (it's ${target.name})` };
     }
 
-    // Find adjacent solid block and determine face
+    // Non-solid blocks that can't be used as reference for placing
+    const nonSolidBlocks = new Set([
+      'short_grass', 'tall_grass', 'fern', 'large_fern', 'dandelion', 'poppy',
+      'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip',
+      'white_tulip', 'pink_tulip', 'oxeye_daisy', 'cornflower', 'lilac', 'rose_bush',
+      'pitcher_plant', 'wither_rose', 'sunflower', 'lily_pad', 'vine', 'glow_lichen',
+      'seagrass', 'tall_seagrass', 'kelp', 'dead_bush', 'brown_mushroom', 'red_mushroom',
+      'cactus', 'snow', 'fire', 'lava', 'water', 'bubble_column', 'enchanting_table',
+    ]);
+
+    function isPlaceableReference(block: any): boolean {
+      if (!block) return false;
+      if (block.name === 'air' || block.name === 'cave_air' || block.name === 'void_air') return false;
+      if (nonSolidBlocks.has(block.name)) return false;
+      // Check if block is "full" (has a full bounding box)
+      if (block.boundingBox && block.boundingBox.fullBlock === false) return false;
+      return true;
+    }
+
+    // Find adjacent solid block to place against
     const dirs = [
-      { dx: -1, dy: 0, dz: 0, face: new Vec3(1, 0, 0) },
-      { dx: 1, dy: 0, dz: 0, face: new Vec3(-1, 0, 0) },
-      { dx: 0, dy: -1, dz: 0, face: new Vec3(0, 1, 0) },
-      { dx: 0, dy: 1, dz: 0, face: new Vec3(0, -1, 0) },
-      { dx: 0, dy: 0, dz: -1, face: new Vec3(0, 0, 1) },
-      { dx: 0, dy: 0, dz: 1, face: new Vec3(0, 0, -1) },
+      { dx: 0, dy: -1, dz: 0, label: 'below' },
+      { dx: -1, dy: 0, dz: 0, label: 'west' },
+      { dx: 1, dy: 0, dz: 0, label: 'east' },
+      { dx: 0, dy: 0, dz: -1, label: 'south' },
+      { dx: 0, dy: 0, dz: 1, label: 'north' },
+      { dx: 0, dy: 1, dz: 0, label: 'above' },
     ];
 
     for (const dir of dirs) {
       const neighbor = bot.blockAt(new Vec3(x + dir.dx, y + dir.dy, z + dir.dz));
-      if (neighbor && neighbor.name !== 'air' && neighbor.name !== 'cave_air' && neighbor.name !== 'void_air') {
-        // Distance check: if reference block is too far, return error (let agent use move_to first)
-        if (!bot.canSeeBlock(neighbor)) {
-          const dist = bot.entity.position.distanceTo(neighbor.position);
-          return { error: `Too far to place (reference block at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.`, referenceBlockPos: { x: x + dir.dx, y: y + dir.dy, z: z + dir.dz } };
-        }
+      if (!isPlaceableReference(neighbor)) continue;
 
-        // Look at the target position before placing (safe, stops pathfinder first)
-        await safeLookAt(bot, new Vec3(x, y, z), true);
+      // Distance check: if reference block is too far, return error
+      if (!bot.canSeeBlock(neighbor)) {
+        const dist = bot.entity.position.distanceTo(neighbor.position);
+        return { error: `Too far to place (reference block "${neighbor.name}" at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.`, referenceBlockPos: { x: x + dir.dx, y: y + dir.dy, z: z + dir.dz } };
+      }
 
-        // Place with timeout protection (5s)
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('placeBlock timed out (5s)')), 5000);
-            bot!.placeBlock(neighbor, dir.face).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
-          });
-          return { success: true, placedAt: { x, y, z }, referenceBlock: neighbor.name };
-        } catch (e: any) {
-          const msg = e instanceof Error ? e.message : String(e);
-          // Try next face if this one fails
-          if (!msg.includes('timed out')) return { error: `Failed to place: ${msg}` };
-          continue;
+      // Look at the reference block (not the target) so the right face is clicked
+      await safeLookAt(bot, new Vec3(neighbor.x, neighbor.y, neighbor.z), true);
+
+      // Use activateBlock (right-click the block) with timeout
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('activateBlock timed out (5s)')), 5000);
+          bot!.activateBlock(neighbor).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+        });
+        return { success: true, placedAt: { x, y, z }, referenceBlock: neighbor.name, method: 'activateBlock' };
+      } catch (e: any) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes('timed out')) {
+          return { error: `Failed to activate block: ${msg}`, referenceBlock: neighbor.name };
         }
+        // Timeout - try next direction
+        continue;
       }
     }
     return { error: 'No adjacent solid block found to place against (or all attempts timed out)' };
