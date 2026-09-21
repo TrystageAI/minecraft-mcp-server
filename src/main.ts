@@ -498,25 +498,10 @@ registerTool(
     }
     const originalBlockName = block.name;
 
-    // Distance check: if block is too far to dig, try to pathfind closer
+    // Distance check: if block is too far, return error (let agent use move_to first)
     if (!bot.canSeeBlock(block)) {
       const dist = bot.entity.position.distanceTo(blockPos);
-      if (dist > 5) {
-        try {
-          const nearGoal = new goals.GoalNear(x, y, z, 1);
-          await new Promise<void>((resolve, reject) => {
-            const b = bot!;
-            const timer = setTimeout(() => {
-              b.pathfinder.stop();
-              reject(new Error(`Too far from block (${dist.toFixed(1)}m), could not reach in time`));
-            }, 10000);
-            b.once('goal_reached', () => { clearTimeout(timer); resolve(); });
-            b.pathfinder.setGoal(nearGoal);
-          });
-        } catch (pathErr: any) {
-          return { success: false, reason: `Too far to break: ${pathErr.message || 'could not pathfind closer'}` };
-        }
-      }
+      return { success: false, reason: `Too far to break (block at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.` };
     }
 
     // Look at the block center
@@ -732,26 +717,10 @@ registerTool(
     for (const dir of dirs) {
       const neighbor = bot.blockAt(new Vec3(x + dir.dx, y + dir.dy, z + dir.dz));
       if (neighbor && neighbor.name !== 'air' && neighbor.name !== 'cave_air' && neighbor.name !== 'void_air') {
-        // Distance check: if reference block is too far to interact with, try to move closer
+        // Distance check: if reference block is too far, return error (let agent use move_to first)
         if (!bot.canSeeBlock(neighbor)) {
           const dist = bot.entity.position.distanceTo(neighbor.position);
-          if (dist > 5) {
-            // Try to pathfind closer with a timeout
-            try {
-              const nearGoal = new goals.GoalNear(x + dir.dx, y + dir.dy, z + dir.dz, 1);
-              await new Promise<void>((resolve, reject) => {
-                const b = bot!;
-                const timer = setTimeout(() => {
-                  b.pathfinder.stop();
-                  reject(new Error(`Too far from reference block (${dist.toFixed(1)}m), could not reach in time`));
-                }, 8000);
-                b.once('goal_reached', () => { clearTimeout(timer); resolve(); });
-                b.pathfinder.setGoal(nearGoal);
-              });
-            } catch (pathErr: any) {
-              return { error: `Too far to place (${dir.dx},${dir.dy},${dir.dz}) face: ${pathErr.message || 'could not pathfind closer'}` };
-            }
-          }
+          return { error: `Too far to place (reference block at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.`, referenceBlockPos: { x: x + dir.dx, y: y + dir.dy, z: z + dir.dz } };
         }
 
         // Look at the target position before placing
