@@ -390,28 +390,16 @@ registerTool(
     // Look at the block center
     await bot.lookAt(blockPos, true);
 
-    // Start mining (runtime methods not in type defs, cast to any)
+    // Start mining
     try {
-      await (bot as any).attackBlock(block, true);
+      await bot.dig(block, true);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      return { success: false, reason: `attackBlock failed: ${msg}` };
+      return { success: false, reason: `dig failed: ${msg}` };
     }
 
-    // Wait for the block to break (max 30s)
-    const timeout = 30000;
-    const startTime = Date.now();
-    while (Date.now() - startTime < timeout) {
-      const currentBlock = bot.blockAt(blockPos);
-      if (!currentBlock || currentBlock.name === 'air') {
-        try { (bot as any).stopAction(); } catch { /* ignore */ }
-        return { success: true, brokenBlock: originalBlockName, position: blockPos };
-      }
-      await new Promise((r) => setTimeout(r, 200));
-    }
-
-    try { (bot as any).stopAction(); } catch { /* ignore */ }
-    return { success: false, reason: 'Timeout after 30s', blockName: originalBlockName };
+    // dig() resolves when block is fully broken
+    return { success: true, brokenBlock: originalBlockName, position: blockPos };
   },
 );
 
