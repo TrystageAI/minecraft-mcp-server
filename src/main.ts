@@ -28,6 +28,22 @@ const CONFIG = {
 // --- Bot reference ---
 let bot: Bot | null = null;
 
+// --- Chat history ---
+interface ChatMessage {
+  sender: string;
+  message: string;
+  timestamp: number;
+}
+const chatHistory: ChatMessage[] = [];
+const MAX_CHAT_HISTORY = 100;
+
+function recordChat(sender: string, message: string) {
+  chatHistory.push({ sender, message, timestamp: Date.now() });
+  if (chatHistory.length > MAX_CHAT_HISTORY) {
+    chatHistory.splice(0, chatHistory.length - MAX_CHAT_HISTORY);
+  }
+}
+
 // --- Tool infrastructure ---
 type ToolDefinition = {
   name: string;
@@ -58,8 +74,13 @@ registerTool(
   },
   async () => {
     if (!bot) return { error: 'Not connected' };
+    const pos = bot.entity.position;
+    const blockPos = new Vec3(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z));
+    const footBlock = new Vec3(Math.floor(pos.x), Math.floor(pos.y) - 1, Math.floor(pos.z));
     return {
       position: bot.entity.position,
+      blockPosition: { x: blockPos.x, y: blockPos.y, z: blockPos.z },
+      footBlock: { x: footBlock.x, y: footBlock.y, z: footBlock.z },
       health: bot.health,
       food: bot.food,
       experience: bot.experience,
@@ -86,6 +107,29 @@ registerTool(
       });
     });
     return { items };
+  },
+);
+
+registerTool(
+  'debug_inventory',
+  {
+    name: 'debug_inventory',
+    description: 'Debug: 显示原始 inventory slots 状态（快捷栏 36-44 和当前选中槽位）',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  async () => {
+    if (!bot) return { error: 'Not connected' };
+    const slots = bot.inventory.slots;
+    const hotbar = slots.slice(36, 45).map((s, i) => s ? { slot: i, name: s.name, count: s.count } : null);
+    const mainInv = slots.slice(9, 36).map((s, i) => s ? { slot: i + 9, name: s.name, count: s.count } : null);
+    const selected = bot.inventory.selectedItem;
+    const selectedSlot = bot.quickBarSlot;
+    return {
+      selectedSlot,
+      selectedItem: selected ? { name: selected.name, count: selected.count } : null,
+      hotbar,
+      mainInv: mainInv.filter(Boolean),
+    };
   },
 );
 
@@ -367,13 +411,22 @@ registerTool(
   async (args) => {
     if (!bot) return { error: 'Not connected' };
     const itemName = String(args.itemName);
-    const item = (bot.inventory as any).findSlot(
-      (i: Item) => i.name === itemName && i.slot !== 40 && i.slot !== 45,
-      -1,
-    );
-    if (!item) return { success: false, reason: 'Item not found' };
-    await bot.equip(item, 'hand');
-    return { success: true, equipped: itemName };
+    // bot.inventory has no findSlot - iterate slots directly
+    // Skip armor slots (36-39) and offhand (45), only search 0-35 (main + hotbar)
+    let foundItem: any = null;
+    for (let s = 0; s < bot.inventory.slots.length; s++) {
+      if (s >= 36 && s <= 39) continue; // skip armor
+      if (s === 45) continue; // skip offhand
+      const item = bot.inventory.slots[s];
+      if (item && item.name === itemName) { foundItem = item; break; }
+    }
+    if (!foundItem) return { success: false, reason: `Item "${itemName}" not found in inventory` };
+    try {
+      await bot.equip(foundItem, 'hand');
+      return { success: true, equipped: itemName };
+    } catch (e: any) {
+      return { success: false, reason: e.message };
+    }
   },
 );
 
@@ -445,12 +498,43 @@ registerTool(
     }
     const originalBlockName = block.name;
 
+    // Distance check: if block is too far to dig, try to pathfind closer
+    if (!bot.canSeeBlock(block)) {
+      const dist = bot.entity.position.distanceTo(blockPos);
+      if (dist > 5) {
+        try {
+          const nearGoal = new goals.GoalNear(x, y, z, 1);
+          await new Promise<void>((resolve, reject) => {
+            const b = bot!;
+            const timer = setTimeout(() => {
+              b.pathfinder.stop();
+              reject(new Error(`Too far from block (${dist.toFixed(1)}m), could not reach in time`));
+            }, 10000);
+            b.once('goal_reached', () => { clearTimeout(timer); resolve(); });
+            b.pathfinder.setGoal(nearGoal);
+          });
+        } catch (pathErr: any) {
+          return { success: false, reason: `Too far to break: ${pathErr.message || 'could not pathfind closer'}` };
+        }
+      }
+    }
+
     // Look at the block center
     await bot.lookAt(blockPos, true);
 
-    // Start mining
+    // Start mining with timeout protection
+    // Hardness-based timeout: soft blocks 5s, stone 30s, obsidian 120s
+    const hardness = block.hardness ?? 1;
+    const timeoutMs = Math.min(120000, Math.max(5000, hardness * 15000));
+
     try {
-      await bot.dig(block, true);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          bot!.control.digging = false; // stop digging
+          reject(new Error(`dig timed out after ${timeoutMs / 1000}s (hardness: ${hardness})`));
+        }, timeoutMs);
+        bot!.dig(block, true).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return { success: false, reason: `dig failed: ${msg}` };
@@ -492,7 +576,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: 'text', text: `Unknown tool: ${params.name}` }] };
   }
   try {
-    const result = await tool.handler(params.arguments || {});
+    const result = await tool.handler(params.arguments || {}) as any;
+    // Support image responses: if result contains __image, return image content
+    if (result && result.__image) {
+      const { __image, __mimeType, ...rest } = result;
+      const content: any[] = [
+        { type: 'image', data: __image, mimeType: __mimeType || 'image/png' },
+      ];
+      if (Object.keys(rest).length > 0) {
+        content.push({ type: 'text', text: JSON.stringify(rest, null, 2) });
+      }
+      return { content };
+    }
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -547,6 +642,16 @@ function createBot(): Bot {
     }
   });
 
+  b.on('message', (msg: any) => {
+    const text = typeof msg === 'string' ? msg : msg?.toString?.() || '';
+    const sender = msg?.username || 'Server';
+    recordChat(sender, text);
+  });
+
+  b.on('messagestr', (msg: string) => {
+    recordChat('Server', msg);
+  });
+
   return b;
 }
 
@@ -554,13 +659,14 @@ registerTool(
   'place_block',
   {
     name: 'place_block',
-    description: '在指定位置放置当前手持方块。会自动寻找相邻方块作为参考面。',
+    description: '在指定位置放置方块。可指定itemName从背包自动取用，也会自动寻找相邻方块作为参考面。',
     inputSchema: {
       type: 'object',
       properties: {
         x: { type: 'number', description: '目标 X 坐标' },
         y: { type: 'number', description: '目标 Y 坐标' },
         z: { type: 'number', description: '目标 Z 坐标' },
+        itemName: { type: 'string', description: '要放置的物品名称（如 crafting_table），不填则使用当前手持' },
       },
       required: ['x', 'y', 'z'],
     },
@@ -570,6 +676,42 @@ registerTool(
     const x = Math.floor(Number(args.x));
     const y = Math.floor(Number(args.y));
     const z = Math.floor(Number(args.z));
+    const itemName = args.itemName ? String(args.itemName) : null;
+
+    // If itemName provided, make sure it's in hand
+    if (itemName) {
+      const itemData = (bot.registry as any).itemsByName?.[itemName];
+      if (!itemData) return { error: `Item "${itemName}" not found in registry` };
+      // Check if already in selected hotbar slot (bot.heldItem, not selectedItem!)
+      const held = bot.heldItem as any;
+      if (!held || held.name !== itemName) {
+        // Find item in inventory (scan all slots)
+        let invSlot = -1;
+        for (let s = 0; s < bot.inventory.slots.length; s++) {
+          const item = bot.inventory.slots[s];
+          if (item && item.name === itemName) { invSlot = s; break; }
+        }
+        if (invSlot === -1) return { error: `Item "${itemName}" not found in inventory` };
+        // Find an empty hotbar slot (indices 36-44 in bot.inventory.slots)
+        let targetSlot = -1;
+        for (let s = 36; s < 45; s++) {
+          if (!bot.inventory.slots[s]) { targetSlot = s; break; }
+        }
+        if (targetSlot === -1) return { error: 'No empty hotbar slot available' };
+        try {
+          // Move with timeout protection (5s max)
+          const movePromise = bot.moveSlotItem(invSlot, targetSlot);
+          const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('move timeout')), 5000));
+          await Promise.race([movePromise, timeout]);
+          await new Promise(r => setTimeout(r, 300));
+          bot.setQuickBarSlot(targetSlot - 36);
+          await new Promise(r => setTimeout(r, 100));
+        } catch (e: any) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { error: `Failed to move item to hotbar: ${msg}` };
+        }
+      }
+    }
 
     // Check target is air
     const target = bot.blockAt(new Vec3(x, y, z));
@@ -590,15 +732,47 @@ registerTool(
     for (const dir of dirs) {
       const neighbor = bot.blockAt(new Vec3(x + dir.dx, y + dir.dy, z + dir.dz));
       if (neighbor && neighbor.name !== 'air' && neighbor.name !== 'cave_air' && neighbor.name !== 'void_air') {
+        // Distance check: if reference block is too far to interact with, try to move closer
+        if (!bot.canSeeBlock(neighbor)) {
+          const dist = bot.entity.position.distanceTo(neighbor.position);
+          if (dist > 5) {
+            // Try to pathfind closer with a timeout
+            try {
+              const nearGoal = new goals.GoalNear(x + dir.dx, y + dir.dy, z + dir.dz, 1);
+              await new Promise<void>((resolve, reject) => {
+                const b = bot!;
+                const timer = setTimeout(() => {
+                  b.pathfinder.stop();
+                  reject(new Error(`Too far from reference block (${dist.toFixed(1)}m), could not reach in time`));
+                }, 8000);
+                b.once('goal_reached', () => { clearTimeout(timer); resolve(); });
+                b.pathfinder.setGoal(nearGoal);
+              });
+            } catch (pathErr: any) {
+              return { error: `Too far to place (${dir.dx},${dir.dy},${dir.dz}) face: ${pathErr.message || 'could not pathfind closer'}` };
+            }
+          }
+        }
+
+        // Look at the target position before placing
+        await bot.lookAt(new Vec3(x, y, z), true);
+
+        // Place with timeout protection (5s)
         try {
-          await bot.placeBlock(neighbor, dir.face);
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('placeBlock timed out (5s)')), 5000);
+            bot!.placeBlock(neighbor, dir.face).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+          });
           return { success: true, placedAt: { x, y, z }, referenceBlock: neighbor.name };
         } catch (e: any) {
-          return { error: `Failed to place: ${e.message}` };
+          const msg = e instanceof Error ? e.message : String(e);
+          // Try next face if this one fails
+          if (!msg.includes('timed out')) return { error: `Failed to place: ${msg}` };
+          continue;
         }
       }
     }
-    return { error: 'No adjacent solid block found to place against' };
+    return { error: 'No adjacent solid block found to place against (or all attempts timed out)' };
   },
 );
 
@@ -941,8 +1115,72 @@ registerTool(
     if (!bot) return { error: 'Not connected' };
     let cmd = String(args.command);
     if (!cmd.startsWith('/')) cmd = '/' + cmd;
+    const beforeLen = chatHistory.length;
     bot.chat(cmd);
-    return { success: true, command: cmd };
+    // Wait for server response
+    await new Promise((r) => setTimeout(r, 2500));
+    const responses = chatHistory.slice(beforeLen);
+    return { success: true, command: cmd, responses };
+  },
+);
+
+registerTool(
+  'get_recipes_for',
+  {
+    name: 'get_recipes_for',
+    description: '查询某个物品的合成配方（需要哪些材料）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        itemName: { type: 'string', description: '物品名称，如 crafting_table, stone_pickaxe' },
+      },
+      required: ['itemName'],
+    },
+  },
+  async (args) => {
+    if (!bot) return { error: 'Not connected' };
+    const itemName = String(args.itemName);
+    const itemData = (bot.registry as any).itemsByName?.[itemName];
+    if (!itemData) return { error: `Item "${itemName}" not found in registry` };
+
+    const recipes = bot.recipesFor(itemData.id, null, 1, true);
+    if (!recipes || recipes.length === 0) {
+      return { found: false, message: `No recipe found for "${itemName}"` };
+    }
+
+    return {
+      found: true,
+      itemName,
+      recipeCount: recipes.length,
+      recipes: recipes.map((r: any) => ({
+        requiresTable: !!r.requiresTable,
+        output: r.output?.name || 'unknown',
+        ingredients: (r.ingredients || []).map((ing: any) => ({
+          name: ing?.name || 'unknown',
+          count: ing?.count || 1,
+          position: ing?.position || null,
+        })),
+      })),
+    };
+  },
+);
+
+registerTool(
+  'get_chat_history',
+  {
+    name: 'get_chat_history',
+    description: '获取最近的聊天/命令反馈消息列表',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: '返回条数，默认 10，最大 50' },
+      },
+    },
+  },
+  async (args) => {
+    const limit = Math.min(Number(args.limit) || 10, 50);
+    const messages = chatHistory.slice(-limit);
+    return { count: messages.length, messages };
   },
 );
 
@@ -1006,7 +1244,7 @@ registerTool(
     const slot = Number(args.slot);
     if (slot < 0 || slot > 8) return { error: 'Slot must be 0-8' };
     bot.setQuickBarSlot(slot);
-    const item = bot.inventory.selectedItem;
+    const item = bot.heldItem as any;
     return { success: true, slot, selectedItem: item ? { name: item.name, count: item.count } : null };
   },
 );
@@ -1054,7 +1292,7 @@ registerTool(
   },
   async () => {
     if (!bot) return { error: 'Not connected' };
-    const item = bot.inventory.selectedItem;
+    const item = bot.heldItem as any;
     if (!item) return { heldItem: null };
     return {
       heldItem: {
@@ -1083,6 +1321,167 @@ registerTool(
     const biomeData = (bot.registry as any).biomes?.[biome];
     const biomeName = biomeData?.name || `biome_${biome}`;
     return { biome: biomeName, block: block.name };
+  },
+);
+
+registerTool(
+  'screenshot_2d',
+  {
+    name: 'screenshot_2d',
+    description: '生成当前玩家周围的 2D 俯视图截图。显示地形方块颜色、实体位置（彩色点）和玩家朝向箭头。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        range: { type: 'number', description: '扫描半径（方块数），默认 32，最大 64' },
+        size: { type: 'number', description: '输出图片边长像素，默认 1280' },
+      },
+    },
+  },
+  async (args) => {
+    if (!bot || !bot.entity) return { error: 'Bot not fully connected yet' };
+    const { createCanvas } = await import('canvas');
+
+    const range = Math.min(Number(args.range) || 32, 64);
+    const size = Math.min(Number(args.size) || 1280, 2048);
+    const pxPerBlock = size / (range * 2);
+
+    const px = Math.floor(bot.entity.position.x);
+    const py = Math.floor(bot.entity.position.y);
+    const pz = Math.floor(bot.entity.position.z);
+
+    const canvas = createCanvas(size, size);
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, size, size);
+
+    // Block color map (common blocks)
+    const blockColors: Record<string, string> = {
+      grass_block: '#5d8a3c', grass_path: '#8a7242', dirt: '#8b5e3c',
+      stone: '#8a8a8a', cobblestone: '#7a7a7a', bedrock: '#4a4a4a',
+      oak_log: '#6b4c2a', spruce_log: '#4a3520', birch_log: '#d4c5a0',
+      oak_planks: '#c4a265', spruce_planks: '#6b4a2a', birch_planks: '#d4c090',
+      oak_leaves: '#3a7a2a', spruce_leaves: '#2a5a1a', birch_leaves: '#4a8a3a',
+      sand: '#e8d8a0', gravel: '#7a7a7a', sandstone: '#d4c090',
+      water: '#3050a8', lava: '#c04010', ice: '#a0d0f0', packed_ice: '#80b8e8',
+      snow: '#f0f0f0', snow_block: '#f0f0f0', powder_snow: '#e0e8f0',
+      clay: '#8aa8b8', mossy_cobblestone: '#5a7a5a',
+      deepslate: '#4a4a52', cobbled_deepslate: '#5a5a62', tuff: '#5a6a5a',
+      andesite: '#7a8a8a', diorite: '#b0b0b8', granite: '#a0706a',
+      obsidian: '#1a0a2a', nether_bricks: '#3a1a1a', soul_sand: '#4a3a2a',
+      netherrack: '#8a3030', end_stone: '#b0a870',
+      brick_block: '#8a4a3a', stone_bricks: '#6a6a6a', moss_block: '#4a7a4a',
+      mycelium: '#5a6a5a', soul_soil: '#5a4a3a', basalt: '#4a4a4a',
+      smooth_stone: '#9a9a9a', polished_granite: '#b08078', polished_diorite: '#c0c0c8',
+      polished_andesite: '#8a9a9a', quartz_block: '#f0e8e0', terracotta: '#c07a5a',
+      prismarine: '#5aa8a0', dark_prismarine: '#3a6a68', sea_lantern: '#b0e0d8',
+      glowstone: '#e8a030', nether_wart_block: '#8a3a5a', warped_wart_block: '#3a8a6a',
+      purpur_block: '#c090c0', bone_block: '#e0dcd0',
+      // ores
+      coal_ore: '#6a6a6a', iron_ore: '#c0a890', copper_ore: '#a07850',
+      gold_ore: '#c0a030', redstone_ore: '#8a2a2a', lapis_ore: '#3a3a8a',
+      diamond_ore: '#50c0c0', emerald_ore: '#30a050',
+      nether_gold_ore: '#c0a030', nether_quartz_ore: '#e0d8d0',
+      ancient_debris: '#4a3a3a',
+    };
+
+    // Render blocks: scan surface (topmost non-air block per column)
+    for (let dx = -range; dx < range; dx++) {
+      for (let dz = -range; dz < range; dz++) {
+        const bx = px + dx;
+        const bz = pz + dz;
+        // Scan downward from py+16 to py-32 for surface
+        let blockName = 'air';
+        for (let dy = 16; dy >= -32; dy--) {
+          const b = bot.blockAt(new Vec3(bx, py + dy, bz));
+          if (b && b.name !== 'air' && b.name !== 'cave_air') {
+            blockName = b.name;
+            break;
+          }
+        }
+        const color = blockColors[blockName] || '#2a2a3a';
+        const cx = (dx + range) * pxPerBlock;
+        const cy = (dz + range) * pxPerBlock;
+        ctx.fillStyle = color;
+        ctx.fillRect(cx, cy, Math.ceil(pxPerBlock), Math.ceil(pxPerBlock));
+      }
+    }
+
+    // Render entities as dots
+    const entityColors: Record<string, string> = {
+      zombie: '#3a8a3a', skeleton: '#c0c0c0', creeper: '#50c050',
+      spider: '#4a3a3a', enderman: '#1a1a1a', villager: '#8a6a4a',
+      iron_golem: '#c0c0c0', wolf: '#8a7a5a', cat: '#c08050',
+      cow: '#8a6a4a', pig: '#e0a0a0', sheep: '#e0e0e0',
+      chicken: '#f0f0f0', horse: '#8a5a2a', bat: '#3a3a4a',
+      blaze: '#e0a030', wither_skeleton: '#4a4a5a', ghast: '#e8e8f0',
+      player: '#50a0e0',
+    };
+
+    const dotRadius = Math.max(3, pxPerBlock * 1.5);
+    for (const [, entity] of Object.entries(bot.entities)) {
+      const ex = Math.floor(entity.position.x);
+      const ez = Math.floor(entity.position.z);
+      const edx = ex - px;
+      const edz = ez - pz;
+      if (Math.abs(edx) >= range || Math.abs(edz) >= range) continue;
+      const cx = (edx + range) * pxPerBlock + pxPerBlock / 2;
+      const cy = (edz + range) * pxPerBlock + pxPerBlock / 2;
+      const color = (entity.name && entityColors[entity.name]) || '#ff8040';
+      ctx.beginPath();
+      ctx.arc(cx, cy, dotRadius, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // Player position + facing arrow (center)
+    const centerX = size / 2;
+    const centerY = size / 2;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, dotRadius * 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    ctx.strokeStyle = '#3050a8';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Facing arrow
+    const yawRad = (bot.entity.yaw * Math.PI) / 180;
+    const arrowLen = pxPerBlock * 4;
+    const ax = centerX + Math.sin(yawRad) * arrowLen;
+    const ay = centerY - Math.cos(yawRad) * arrowLen;
+    ctx.beginPath();
+    ctx.moveTo(centerX, centerY);
+    ctx.lineTo(ax, ay);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Grid lines (subtle)
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= range * 2; i += 8) {
+      const pos = i * pxPerBlock;
+      ctx.beginPath(); ctx.moveTo(pos, 0); ctx.lineTo(pos, size); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, pos); ctx.lineTo(size, pos); ctx.stroke();
+    }
+
+    const imageData = canvas.toBuffer('image/png').toString('base64');
+
+    return {
+      __image: imageData,
+      __mimeType: 'image/png',
+      info: {
+        player: { x: px, y: py, z: pz, yaw: Math.round(bot.entity.yaw * 10) / 10 },
+        range,
+        size: `${size}x${size}`,
+        entities_in_view: Object.entries(bot.entities).filter(([, e]) =>
+          Math.abs(Math.floor(e.position.x) - px) < range && Math.abs(Math.floor(e.position.z) - pz) < range
+        ).length,
+      },
+    };
   },
 );
 
