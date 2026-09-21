@@ -136,7 +136,7 @@ registerTool(
     const x = Number(args.x);
     const y = Number(args.y);
     const z = Number(args.z);
-    const goal = new goals.GoalNear(x, y, z, 2);
+    const goal = new goals.GoalNear(x, y, z, 1);
     return new Promise((resolve) => {
       const b = bot!;
       let done = false;
@@ -374,6 +374,47 @@ registerTool(
     if (!item) return { success: false, reason: 'Item not found' };
     await bot.equip(item, 'hand');
     return { success: true, equipped: itemName };
+  },
+);
+
+registerTool(
+  'walk_toward',
+  {
+    name: 'walk_toward',
+    description: '朝指定坐标方向持续行走（不使用寻路，直接面朝目标往前走，用于靠近掉落物等）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: '目标 X 坐标' },
+        y: { type: 'number', description: '目标 Y 坐标' },
+        z: { type: 'number', description: '目标 Z 坐标' },
+        durationSec: { type: 'number', description: '行走持续秒数，默认 3' },
+      },
+      required: ['x', 'y', 'z'],
+    },
+  },
+  async (args) => {
+    if (!bot) return { error: 'Not connected' };
+    const x = Number(args.x);
+    const y = Number(args.y);
+    const z = Number(args.z);
+    const duration = Number(args.durationSec) || 3;
+
+    // Look at target
+    await bot.lookAt(new Vec3(x, y, z), false);
+
+    // Start moving forward
+    const b = bot!;
+    (b as any).setControlState('forward', true);
+    (b as any).setControlState('sneak', false);
+
+    // Walk for duration
+    await new Promise((r) => setTimeout(r, duration * 1000));
+
+    // Stop
+    (b as any).setControlState('forward', false);
+
+    return { success: true, finalPosition: b.entity.position };
   },
 );
 
