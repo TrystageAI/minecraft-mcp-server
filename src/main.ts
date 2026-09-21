@@ -753,58 +753,94 @@ registerTool(
       'white_tulip', 'pink_tulip', 'oxeye_daisy', 'cornflower', 'lilac', 'rose_bush',
       'pitcher_plant', 'wither_rose', 'sunflower', 'lily_pad', 'vine', 'glow_lichen',
       'seagrass', 'tall_seagrass', 'kelp', 'dead_bush', 'brown_mushroom', 'red_mushroom',
-      'cactus', 'snow', 'fire', 'lava', 'water', 'bubble_column', 'enchanting_table',
+      'snow', 'fire', 'lava', 'water', 'bubble_column',
     ]);
 
     function isPlaceableReference(block: any): boolean {
       if (!block) return false;
       if (block.name === 'air' || block.name === 'cave_air' || block.name === 'void_air') return false;
       if (nonSolidBlocks.has(block.name)) return false;
-      // Check if block is "full" (has a full bounding box)
-      if (block.boundingBox && block.boundingBox.fullBlock === false) return false;
       return true;
     }
 
-    // Find adjacent solid block to place against
-    const dirs = [
-      { dx: 0, dy: -1, dz: 0, label: 'below' },
-      { dx: -1, dy: 0, dz: 0, label: 'west' },
-      { dx: 1, dy: 0, dz: 0, label: 'east' },
-      { dx: 0, dy: 0, dz: -1, label: 'south' },
-      { dx: 0, dy: 0, dz: 1, label: 'north' },
-      { dx: 0, dy: 1, dz: 0, label: 'above' },
+    // Direction numbers for the block_place packet:
+    // The 'direction' field = which face of the REFERENCE block was clicked.
+    // New block appears on the OUTSIDE of that face:
+    // 0=bottom(-Y), 1=top(+Y), 2=north(-Z), 3=south(+Z), 4=west(-X), 5=east(+X)
+    // So to place ABOVE ref: click top(1), BELOW ref: click bottom(0),
+    // NORTH of ref: click north face(2), SOUTH of ref: click south face(3), etc.
+    const faceDirs = [
+      { dx: 0, dy: -1, dz: 0, dirNum: 1 },  // ref is below target → click TOP of ref → block appears above
+      { dx: 0, dy: 1, dz: 0, dirNum: 0 },   // ref is above target → click BOTTOM of ref → block appears below
+      { dx: 0, dy: 0, dz: -1, dirNum: 3 },  // ref is north of target → click SOUTH face of ref → block appears south
+      { dx: 0, dy: 0, dz: 1, dirNum: 2 },   // ref is south of target → click NORTH face of ref → block appears north
+      { dx: -1, dy: 0, dz: 0, dirNum: 5 },  // ref is west of target → click EAST face of ref → block appears east
+      { dx: 1, dy: 0, dz: 0, dirNum: 4 },   // ref is east of target → click WEST face of ref → block appears west
     ];
 
-    for (const dir of dirs) {
-      const neighbor = bot.blockAt(new Vec3(x + dir.dx, y + dir.dy, z + dir.dz));
+    // Helper: set look direction WITHOUT waiting for 'look' event (which hangs)
+    // Directly sets yaw/pitch on entity - mineflayer's physics module will
+    // detect the change and send a 'look' packet to the server on next tick.
+    function setLookImmediate(pos: Vec3) {
+      const { position } = bot!.entity!;
+      const dx = pos.x - position.x;
+      const dy = pos.y - position.y;
+      const dz = pos.z - position.z;
+      const distXZ = Math.sqrt(dx * dx + dz * dz);
+      // Mineflayer yaw: 0=south(+Z), 90=west(-X), -90=east(+X), 180=north(-Z)
+      const yaw = Math.atan2(-dx, -dz) * (180 / Math.PI);
+      const pitch = -Math.atan2(dy, distXZ) * (180 / Math.PI);
+      (bot!.entity as any).yaw = yaw;
+      (bot!.entity as any).pitch = pitch;
+    }
+
+    for (const fd of faceDirs) {
+      const refX = x + fd.dx, refY = y + fd.dy, refZ = z + fd.dz;
+      const neighbor = bot.blockAt(new Vec3(refX, refY, refZ));
       if (!isPlaceableReference(neighbor)) continue;
 
-      // Distance check: if reference block is too far, return error
+      // Distance check
       if (!bot.canSeeBlock(neighbor)) {
         const dist = bot.entity.position.distanceTo(neighbor.position);
-        return { error: `Too far to place (reference block "${neighbor.name}" at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.`, referenceBlockPos: { x: x + dir.dx, y: y + dir.dy, z: z + dir.dz } };
+        return { error: `Too far to place (ref "${neighbor.name}" at ${dist.toFixed(1)}m). Use move_to first.`, refPos: { x: refX, y: refY, z: refZ } };
       }
 
-      // Look at the reference block (not the target) so the right face is clicked
-      await safeLookAt(bot, new Vec3(neighbor.x, neighbor.y, neighbor.z), true);
+      // Set look direction directly (bypass hanging lookAt await)
+      const lookTarget = new Vec3(refX + 0.5, refY + 0.5, refZ + 0.5);
+      setLookImmediate(lookTarget);
+      // Small delay for server to process position update
+      await new Promise(r => setTimeout(r, 150));
 
-      // Use activateBlock (right-click the block) with timeout
+      // Send block_place packet directly
       try {
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('activateBlock timed out (5s)')), 5000);
-          bot!.activateBlock(neighbor).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+        (bot as any)._client.write('block_place', {
+          location: neighbor.position,
+          direction: fd.dirNum,
+          hand: 0,
+          cursorX: 0.5,
+          cursorY: 0.5,
+          cursorZ: 0.5,
+          insideBlock: false,
+          sequence: 0,
         });
-        return { success: true, placedAt: { x, y, z }, referenceBlock: neighbor.name, method: 'activateBlock' };
       } catch (e: any) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!msg.includes('timed out')) {
-          return { error: `Failed to activate block: ${msg}`, referenceBlock: neighbor.name };
-        }
-        // Timeout - try next direction
-        continue;
+        return { error: `Failed to write block_place packet: ${e.message}` };
       }
+
+      // Wait for server to process
+      await new Promise(r => setTimeout(r, 300));
+
+      // Verify if block was placed
+      const placed = bot.blockAt(new Vec3(x, y, z));
+      if (placed && placed.name !== 'air' && placed.name !== 'cave_air') {
+        return { success: true, placedAt: { x, y, z }, placedBlock: placed.name, referenceBlock: neighbor.name };
+      }
+
+      // If not placed, try next direction (might need different face)
+      continue;
     }
-    return { error: 'No adjacent solid block found to place against (or all attempts timed out)' };
+
+    return { error: 'Failed to place block. No valid reference found or placement was rejected by server. Check that target is air and you have the item in hand.' };
   },
 );
 
