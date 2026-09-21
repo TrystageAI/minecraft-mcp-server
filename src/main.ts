@@ -63,6 +63,44 @@ function registerTool(
   tools.set(name, { def, handler });
 }
 
+// --- Helpers ---
+
+/** Stop any active pathfinder goal to prevent it from overriding look/movement */
+function stopPathfinder(b: Bot | null): void {
+  if (!b) return;
+  try {
+    (b as any).pathfinder?.setGoal(null);
+  } catch { /* pathfinder not loaded */ }
+}
+
+/**
+ * Safe lookAt: stops pathfinder first, has 3s timeout, falls back to direct yaw/pitch.
+ * This prevents hangs when pathfinder is active from a previous timed-out move_to.
+ */
+async function safeLookAt(b: Bot | null, pos: Vec3, force: boolean = true): Promise<void> {
+  if (!b || !b.entity) return;
+  stopPathfinder(b);
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('lookAt timeout 3s')), 3000);
+      b!.lookAt(pos, force).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+    });
+  } catch {
+    // Fallback: set yaw/pitch directly using prismarine's lookAt math
+    const { position } = b.entity!;
+    const dx = pos.x - position.x;
+    const dy = pos.y - position.y;
+    const dz = pos.z - position.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const yaw = Math.atan2(dx, dz) * (180 / Math.PI) + 180;
+    const pitch = -Math.atan2(dy, dist) * (180 / Math.PI);
+    (b.entity as any).yaw = yaw;
+    (b.entity as any).pitch = pitch;
+    b.lookAt(pos, force); // fire and forget (no await)
+  }
+}
+
 // --- Tool Registration ---
 
 registerTool(
@@ -212,6 +250,7 @@ registerTool(
         done = true;
         clearInterval(checkRepath);
         b.off('goal_reached', onGoalReached);
+        stopPathfinder(b); // CRITICAL: clear pathfinder goal so it doesn't block future lookAt
         resolve({ success: false, reason: 'Timeout' });
       }, 30000);
     });
@@ -238,7 +277,7 @@ registerTool(
     const x = Number(args.x);
     const y = Number(args.y);
     const z = Number(args.z);
-    await bot.lookAt(new Vec3(x, y, z), true);
+    await safeLookAt(bot, new Vec3(x, y, z), true);
     return { yaw: bot.entity?.yaw, pitch: bot.entity?.pitch };
   },
 );
@@ -266,7 +305,7 @@ registerTool(
       return true;
     });
     if (!entity) return { success: false, reason: 'Entity not found' };
-    await bot.lookAt(entity.position, true);
+    await safeLookAt(bot, entity.position, true);
     await bot.attack(entity);
     return { success: true, entityName: entity.name };
   },
@@ -453,8 +492,11 @@ registerTool(
     const z = Number(args.z);
     const duration = Number(args.durationSec) || 3;
 
-    // Look at target
-    await bot.lookAt(new Vec3(x, y, z), false);
+    // Stop any active pathfinder first
+    stopPathfinder(bot);
+
+    // Look at target (safe, with timeout + fallback)
+    await safeLookAt(bot, new Vec3(x, y, z), false);
 
     // Start moving forward
     const b = bot!;
@@ -504,8 +546,8 @@ registerTool(
       return { success: false, reason: `Too far to break (block at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.` };
     }
 
-    // Look at the block center
-    await bot.lookAt(blockPos, true);
+    // Look at the block center (safe, stops pathfinder first)
+    await safeLookAt(bot, blockPos, true);
 
     // Start mining with timeout protection
     // Hardness-based timeout: soft blocks 5s, stone 30s, obsidian 120s
@@ -723,8 +765,8 @@ registerTool(
           return { error: `Too far to place (reference block at ${dist.toFixed(1)}m, need <5m). Use move_to to get closer first.`, referenceBlockPos: { x: x + dir.dx, y: y + dir.dy, z: z + dir.dz } };
         }
 
-        // Look at the target position before placing
-        await bot.lookAt(new Vec3(x, y, z), true);
+        // Look at the target position before placing (safe, stops pathfinder first)
+        await safeLookAt(bot, new Vec3(x, y, z), true);
 
         // Place with timeout protection (5s)
         try {
@@ -1239,7 +1281,10 @@ registerTool(
       const block = bot.blockAt(new Vec3(Math.floor(Number(args.x)), Math.floor(Number(args.y)), Math.floor(Number(args.z))));
       if (!block) return { error: 'No block at position' };
       try {
-        await bot.activateBlock(block);
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('activateBlock timed out (5s)')), 5000);
+          bot!.activateBlock(block).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
+        });
         return { success: true, activatedBlock: block.name };
       } catch (e: any) {
         return { error: `Activate failed: ${e.message}` };
