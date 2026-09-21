@@ -360,6 +360,61 @@ registerTool(
   },
 );
 
+registerTool(
+  'break_block',
+  {
+    name: 'break_block',
+    description: '破坏/挖掘指定坐标的方块（自动面朝并持续挖掘直到破坏完成）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'X 坐标' },
+        y: { type: 'number', description: 'Y 坐标' },
+        z: { type: 'number', description: 'Z 坐标' },
+      },
+      required: ['x', 'y', 'z'],
+    },
+  },
+  async (args) => {
+    if (!bot) return { error: 'Not connected' };
+    const x = Number(args.x);
+    const y = Number(args.y);
+    const z = Number(args.z);
+    const blockPos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
+    const block = bot.blockAt(blockPos);
+    if (!block || block.name === 'air') {
+      return { success: false, reason: 'No block at position or already air' };
+    }
+    const originalBlockName = block.name;
+
+    // Look at the block center
+    await bot.lookAt(blockPos, true);
+
+    // Start mining (runtime methods not in type defs, cast to any)
+    try {
+      await (bot as any).attackBlock(block, true);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, reason: `attackBlock failed: ${msg}` };
+    }
+
+    // Wait for the block to break (max 30s)
+    const timeout = 30000;
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeout) {
+      const currentBlock = bot.blockAt(blockPos);
+      if (!currentBlock || currentBlock.name === 'air') {
+        try { (bot as any).stopAction(); } catch { /* ignore */ }
+        return { success: true, brokenBlock: originalBlockName, position: blockPos };
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    try { (bot as any).stopAction(); } catch { /* ignore */ }
+    return { success: false, reason: 'Timeout after 30s', blockName: originalBlockName };
+  },
+);
+
 // --- MCP Server ---
 
 const server = new Server(
