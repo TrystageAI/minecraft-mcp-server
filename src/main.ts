@@ -139,8 +139,8 @@ registerTool(
     const goal = new goals.GoalNear(x, y, z, 2);
     return new Promise((resolve) => {
       const b = bot!;
-      b.pathfinder.goal = goal;
-      b.pathfinder.once('path end', () => {
+      b.pathfinder.setGoal(goal);
+      b.pathfinder.once('goal_reached', () => {
         resolve({ success: true, position: b.entity.position });
       });
       const checkRepath = setInterval(() => {
@@ -297,8 +297,9 @@ registerTool(
   },
   async (args) => {
     if (!bot) return { error: 'Not connected' };
+    if (typeof bot.chat !== 'function') return { error: 'Bot not ready (not in play state yet)' };
     const message = String(args.message);
-    await bot.chat(message);
+    bot.chat(message);
     return { sent: message };
   },
 );
@@ -417,18 +418,18 @@ function createBot(): Bot {
   });
 
   b.once('end', () => {
-    console.log('[Bot] Connection ended');
+    console.error('[Bot] Connection ended');
   });
 
   b.loadPlugin(pvpPlugin);
   b.loadPlugin(toolPlugin);
 
   b.on('kicked', (reason: string) => {
-    console.log('[Bot] Kicked:', reason);
+    console.error('[Bot] Kicked:', reason);
   });
 
   b.on('spawn', () => {
-    console.log(`[Bot] Spawned at ${b.entity.position}`);
+    console.error(`[Bot] Spawned at ${b.entity.position}`);
     (b as any).loadPlugin(pathfinder, {
       movements: new (Movements as any)(b),
       allowDiagonals: true,
@@ -436,12 +437,12 @@ function createBot(): Bot {
   });
 
   b.on('login', () => {
-    console.log('[Bot] Logged in as', CONFIG.username);
+    console.error('[Bot] Logged in as', CONFIG.username);
   });
 
   b.on('health', () => {
     if (b.health === 0) {
-      console.log('[Bot] Died!');
+      console.error('[Bot] Died!');
     }
   });
 
@@ -454,8 +455,8 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.log('[MCP] Server running on stdio');
-  console.log(`[Bot] Connecting to ${CONFIG.host}:${CONFIG.port} as ${CONFIG.username}`);
+  console.error('[MCP] Server running on stdio');
+  console.error(`[Bot] Connecting to ${CONFIG.host}:${CONFIG.port} as ${CONFIG.username}`);
 }
 
 main().catch((err: unknown) => {
