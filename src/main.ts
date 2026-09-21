@@ -530,6 +530,7 @@ registerTool(
   },
   async (args) => {
     if (!bot) return { error: 'Not connected' };
+    stopPathfinder(bot);
     const x = Number(args.x);
     const y = Number(args.y);
     const z = Number(args.z);
@@ -700,6 +701,7 @@ registerTool(
   },
   async (args) => {
     if (!bot) return { error: 'Not connected' };
+    stopPathfinder(bot);
     const x = Math.floor(Number(args.x));
     const y = Math.floor(Number(args.y));
     const z = Math.floor(Number(args.z));
