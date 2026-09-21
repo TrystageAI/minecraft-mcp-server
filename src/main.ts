@@ -779,19 +779,21 @@ registerTool(
     ];
 
     // Helper: set look direction WITHOUT waiting for 'look' event (which hangs)
-    // Directly sets yaw/pitch on entity - mineflayer's physics module will
-    // detect the change and send a 'look' packet to the server on next tick.
+    // Sets yaw/pitch and sends look packet via bot.lookAt() (fire-and-forget).
+    // The packet IS sent even though the promise may never resolve.
     function setLookImmediate(pos: Vec3) {
       const { position } = bot!.entity!;
       const dx = pos.x - position.x;
       const dy = pos.y - position.y;
       const dz = pos.z - position.z;
       const distXZ = Math.sqrt(dx * dx + dz * dz);
-      // Mineflayer yaw: 0=south(+Z), 90=west(-X), -90=east(+X), 180=north(-Z)
       const yaw = Math.atan2(-dx, -dz) * (180 / Math.PI);
       const pitch = -Math.atan2(dy, distXZ) * (180 / Math.PI);
       (bot!.entity as any).yaw = yaw;
       (bot!.entity as any).pitch = pitch;
+      // Fire-and-forget: sends the look packet, ignore the promise
+      // (the 'look' event may never fire but the packet goes out)
+      try { bot!.lookAt(pos, true); } catch (_) { /* ignore */ }
     }
 
     for (const fd of faceDirs) {
