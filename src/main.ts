@@ -765,24 +765,18 @@ registerTool(
       return true;
     }
 
-    // Direction numbers for the block_place packet:
-    // The 'direction' field = which face of the REFERENCE block was clicked.
-    // New block appears on the OUTSIDE of that face:
-    // 0=bottom(-Y), 1=top(+Y), 2=north(-Z), 3=south(+Z), 4=west(-X), 5=east(+X)
-    // So to place ABOVE ref: click top(1), BELOW ref: click bottom(0),
-    // NORTH of ref: click north face(2), SOUTH of ref: click south face(3), etc.
+    // Reference block offsets (direction from target to reference)
+    // faceVector points from reference TOWARD target (opposite of offset)
     const faceDirs = [
-      { dx: 0, dy: -1, dz: 0, dirNum: 1 },  // ref is below target → click TOP of ref → block appears above
-      { dx: 0, dy: 1, dz: 0, dirNum: 0 },   // ref is above target → click BOTTOM of ref → block appears below
-      { dx: 0, dy: 0, dz: -1, dirNum: 3 },  // ref is north of target → click SOUTH face of ref → block appears south
-      { dx: 0, dy: 0, dz: 1, dirNum: 2 },   // ref is south of target → click NORTH face of ref → block appears north
-      { dx: -1, dy: 0, dz: 0, dirNum: 5 },  // ref is west of target → click EAST face of ref → block appears east
-      { dx: 1, dy: 0, dz: 0, dirNum: 4 },   // ref is east of target → click WEST face of ref → block appears west
+      { dx: 0, dy: -1, dz: 0, fv: new Vec3(0, 1, 0) },   // ref below target → place above ref
+      { dx: 0, dy: 1, dz: 0, fv: new Vec3(0, -1, 0) },   // ref above target → place below ref
+      { dx: 0, dy: 0, dz: -1, fv: new Vec3(0, 0, 1) },   // ref north of target → place south of ref
+      { dx: 0, dy: 0, dz: 1, fv: new Vec3(0, 0, -1) },   // ref south of target → place north of ref
+      { dx: -1, dy: 0, dz: 0, fv: new Vec3(1, 0, 0) },   // ref west of target → place east of ref
+      { dx: 1, dy: 0, dz: 0, fv: new Vec3(-1, 0, 0) },   // ref east of target → place west of ref
     ];
 
     // Helper: set look direction WITHOUT waiting for 'look' event (which hangs)
-    // Sets yaw/pitch and sends look packet via bot.lookAt() (fire-and-forget).
-    // The packet IS sent even though the promise may never resolve.
     function setLookImmediate(pos: Vec3) {
       const { position } = bot!.entity!;
       const dx = pos.x - position.x;
@@ -794,7 +788,6 @@ registerTool(
       (bot!.entity as any).yaw = yaw;
       (bot!.entity as any).pitch = pitch;
       // Fire-and-forget: sends the look packet, ignore the promise
-      // (the 'look' event may never fire but the packet goes out)
       try { bot!.lookAt(pos, true); } catch (_) { /* ignore */ }
     }
 
@@ -809,38 +802,31 @@ registerTool(
         return { error: `Too far to place (ref "${neighbor.name}" at ${dist.toFixed(1)}m). Use move_to first.`, refPos: { x: refX, y: refY, z: refZ } };
       }
 
-      // Set look direction directly (bypass hanging lookAt await)
+      // Set look direction to the face center (fire-and-forget)
       const lookTarget = new Vec3(refX + 0.5, refY + 0.5, refZ + 0.5);
       setLookImmediate(lookTarget);
-      // Small delay for server to process position update
-      await new Promise(r => setTimeout(r, 150));
+      // Wait for server to process look packet
+      await new Promise(r => setTimeout(r, 200));
 
-      // Send block_place packet directly
+      // Use mineflayer's _genericPlace with forceLook:'ignore' to skip the hanging lookAt
+      // This handles all protocol details (direction, cursor, sequence, worldBorderHit, etc.)
       try {
-        (bot as any)._client.write('block_place', {
-          location: neighbor.position,
-          direction: fd.dirNum,
-          hand: 0,
-          cursorX: 0.5,
-          cursorY: 0.5,
-          cursorZ: 0.5,
-          insideBlock: false,
-          sequence: 0,
-        });
+        await (bot as any)._genericPlace(neighbor, fd.fv, { forceLook: 'ignore', swingArm: 'right' });
       } catch (e: any) {
-        return { error: `Failed to write block_place packet: ${e.message}` };
+        const msg = e instanceof Error ? e.message : String(e);
+        // If it's a "No block has been placed" error from placeBlockWithOptions, that's fine - we verify below
+        // Other errors might be transient, try next direction
+        continue;
       }
 
-      // Wait for server to process
-      await new Promise(r => setTimeout(r, 300));
-
-      // Verify if block was placed
+      // Wait for server to process and verify
+      await new Promise(r => setTimeout(r, 500));
       const placed = bot.blockAt(new Vec3(x, y, z));
-      if (placed && placed.name !== 'air' && placed.name !== 'cave_air') {
+      if (placed && placed.name !== 'air' && placed.name !== 'cave_air' && placed.name !== 'void_air') {
         return { success: true, placedAt: { x, y, z }, placedBlock: placed.name, referenceBlock: neighbor.name };
       }
 
-      // If not placed, try next direction (might need different face)
+      // If not placed, try next direction
       continue;
     }
 
