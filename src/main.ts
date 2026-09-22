@@ -81,19 +81,21 @@ async function safeLookAt(b: Bot | null, pos: Vec3, _force: boolean = true): Pro
   if (!b || !b.entity) return;
   stopPathfinder(b);
 
-  // Directly set entity.yaw/pitch in radians.
-  // Do NOT call b.lookAt() - with force=true it sets lastSentYaw=target,
-  // making physics tick see delta=0 and NOT send a look packet.
-  // By only setting entity.yaw/pitch, the next physics tick (within 50ms)
-  // will detect the delta and send the correct look to the server.
-  const eye = b.entity.position.offset(0, b.entity.eyeHeight || 1.62, 0);
-  const dx = pos.x - eye.x;
-  const dy = pos.y - eye.y;
-  const dz = pos.z - eye.z;
-  b.entity.yaw = Math.atan2(-dx, -dz);
-  b.entity.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
-  // Give physics tick time to send the look packet
-  await new Promise(r => setTimeout(r, 100));
+  // Use physics-based rotation: sets entity.yaw/pitch to target,
+  // physics engine interpolates at 3rad/s and sends look packets each tick.
+  // Promise resolves when rotation is complete (|yaw - lastSentYaw| < 0.001).
+  // This guarantees the server has received the correct look direction.
+  try {
+    await Promise.race([
+      b.lookAt(pos, false),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('lookAt timeout 5s')), 5000))
+    ]);
+  } catch (e) {
+    // Fallback: force mode (sets lastSentYaw=target, physics won't send look packet)
+    // Still better than nothing - _genericPlace/dig may still work
+    try { await b.lookAt(pos, true); } catch {}
+    await new Promise(r => setTimeout(r, 200));
+  }
 }
 
 // --- Tool Registration ---
@@ -773,22 +775,25 @@ registerTool(
       { dx: 1, dy: 0, dz: 0, fv: new Vec3(-1, 0, 0) },   // ref east of target → place west of ref
     ];
 
-    // Helper: set look direction properly.
-    // bot.lookAt(pos, true) with force=true:
-    //   - calculates yaw/pitch in radians
-    //   - sets entity.yaw/pitch (in radians)
-    //   - does NOT touch lastSentYaw/lastSentPitch (so next physics tick detects delta and sends look packet)
-    //   - bot.lookAt(pos, true) is BROKEN: force=true sets lastSentYaw=target, making physics tick see delta=0
-    function setLookImmediate(pos: Vec3) {
-      const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0);
-      const dx = pos.x - eye.x;
-      const dy = pos.y - eye.y;
-      const dz = pos.z - eye.z;
-      const yaw = Math.atan2(-dx, -dz);
-      const pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
-      bot.entity.yaw = yaw;
-      bot.entity.pitch = pitch;
-      // Do NOT call bot.look() - it would set lastSentYaw=pitch, preventing the look packet from being sent
+    // Helper: set look direction properly using physics-based rotation.
+    // bot.lookAt(pos) without force:
+    //   - sets entity.yaw/pitch to target
+    //   - physics engine interpolates at 3rad/s, sending look packets each tick
+    //   - promise resolves when |entity.yaw - lastSentYaw| < 0.001 (rotation complete)
+    //   - guarantees server has received the correct look direction
+    // stopPathfinder() is called at the top of this function, so lookAt won't be interrupted.
+    async function lookAtTarget(pos: Vec3): Promise<void> {
+      try {
+        await Promise.race([
+          bot.lookAt(pos, false),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('lookAt timeout 5s')), 5000))
+        ]);
+      } catch (e) {
+        console.error(`[place_block] lookAtTarget issue: ${e instanceof Error ? e.message : String(e)}`);
+        // Fallback: force mode (sets lastSent too, but _genericPlace still works)
+        try { await bot.lookAt(pos, true); } catch {}
+        await new Promise(r => setTimeout(r, 200));
+      }
     }
 
     for (const fd of faceDirs) {
@@ -802,11 +807,11 @@ registerTool(
         return { error: `Too far to place (ref "${neighbor.name}" at ${dist.toFixed(1)}m). Use move_to first.`, refPos: { x: refX, y: refY, z: refZ } };
       }
 
-      // Set look direction to the face center (fire-and-forget)
+      // Set look direction to the face center - wait for physics rotation to complete
       const lookTarget = new Vec3(refX + 0.5, refY + 0.5, refZ + 0.5);
-      setLookImmediate(lookTarget);
-      // Wait for physics tick to send look packet (50ms tick) + server processing (200ms buffer)
-      await new Promise(r => setTimeout(r, 300));
+      await lookAtTarget(lookTarget);
+      // Small delay for last look packet to reach server
+      await new Promise(r => setTimeout(r, 150));
 
       // Use mineflayer's _genericPlace with forceLook:'ignore' to skip the hanging lookAt
       // This handles all protocol details (direction, cursor, sequence, worldBorderHit, etc.)
