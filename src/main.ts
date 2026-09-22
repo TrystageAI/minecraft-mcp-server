@@ -799,23 +799,34 @@ registerTool(
 
       // Use mineflayer's _genericPlace with forceLook:'ignore' to skip the hanging lookAt
       // This handles all protocol details (direction, cursor, sequence, worldBorderHit, etc.)
+      let placeError = '';
       try {
         await (bot as any)._genericPlace(neighbor, fd.fv, { forceLook: 'ignore', swingArm: 'right' });
       } catch (e: any) {
-        const msg = e instanceof Error ? e.message : String(e);
-        // If it's a "No block has been placed" error from placeBlockWithOptions, that's fine - we verify below
-        // Other errors might be transient, try next direction
+        placeError = e instanceof Error ? e.message : String(e);
+        console.error(`[place_block] _genericPlace failed (ref ${neighbor.name} at ${refX},${refY},${refZ}): ${placeError}`);
         continue;
       }
 
       // Wait for server to process and verify
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 800));
       const placed = bot.blockAt(new Vec3(x, y, z));
-      if (placed && placed.name !== 'air' && placed.name !== 'cave_air' && placed.name !== 'void_air') {
-        return { success: true, placedAt: { x, y, z }, placedBlock: placed.name, referenceBlock: neighbor.name };
+      // Verification: block must have changed from original state
+      const wasAir = !target || target.name === 'air' || target.name === 'cave_air' || target.name === 'void_air';
+      if (wasAir) {
+        // Was air: any non-air block means success
+        if (placed && placed.name !== 'air' && placed.name !== 'cave_air' && placed.name !== 'void_air') {
+          return { success: true, placedAt: { x, y, z }, placedBlock: placed.name, referenceBlock: neighbor.name };
+        }
+      } else {
+        // Was non-solid (e.g. short_grass): block must have CHANGED
+        if (placed && placed.name !== target.name && placed.name !== 'air') {
+          return { success: true, placedAt: { x, y, z }, placedBlock: placed.name, referenceBlock: neighbor.name, replaced: target.name };
+        }
       }
 
-      // If not placed, try next direction
+      // If not placed, log and try next direction
+      console.error(`[place_block] Placement not verified. Target (${x},${y},${z}) still has: ${placed?.name || 'air'}. Ref: ${neighbor.name}. Error: ${placeError || 'none'}`);
       continue;
     }
 
