@@ -735,13 +735,8 @@ registerTool(
       }
     }
 
-    // Check target is air
-    const target = bot.blockAt(new Vec3(x, y, z));
-    if (target && target.name !== 'air' && target.name !== 'cave_air' && target.name !== 'void_air') {
-      return { error: `Target position is not air (it's ${target.name})` };
-    }
-
-    // Non-solid blocks that can't be used as reference for placing
+    // Non-solid blocks that can't be used as reference for placing,
+    // but CAN be replaced by placing a solid block on them
     const nonSolidBlocks = new Set([
       'short_grass', 'tall_grass', 'fern', 'large_fern', 'dandelion', 'poppy',
       'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip',
@@ -750,6 +745,12 @@ registerTool(
       'seagrass', 'tall_seagrass', 'kelp', 'dead_bush', 'brown_mushroom', 'red_mushroom',
       'snow', 'fire', 'lava', 'water', 'bubble_column',
     ]);
+
+    // Check target is air or a non-solid block (which can be replaced)
+    const target = bot.blockAt(new Vec3(x, y, z));
+    if (target && target.name !== 'air' && target.name !== 'cave_air' && target.name !== 'void_air' && !nonSolidBlocks.has(target.name)) {
+      return { error: `Target position is not air (it's ${target.name})` };
+    }
 
     function isPlaceableReference(block: any): boolean {
       if (!block) return false;
