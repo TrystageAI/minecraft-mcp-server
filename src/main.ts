@@ -228,6 +228,7 @@ registerTool(
         done = true;
         clearInterval(checkRepath);
         clearTimeout(timer);
+        stopPathfinder(b); // CRITICAL: stop pathfinder after reaching goal to prevent background movement
         resolve({ success: true, position: b.entity.position });
       };
 
