@@ -77,20 +77,23 @@ function stopPathfinder(b: Bot | null): void {
  * Safe lookAt: stops pathfinder first, has 3s timeout, falls back to direct yaw/pitch.
  * This prevents hangs when pathfinder is active from a previous timed-out move_to.
  */
-async function safeLookAt(b: Bot | null, pos: Vec3, force: boolean = true): Promise<void> {
+async function safeLookAt(b: Bot | null, pos: Vec3, _force: boolean = true): Promise<void> {
   if (!b || !b.entity) return;
   stopPathfinder(b);
 
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('lookAt timeout 3s')), 3000);
-      b!.lookAt(pos, force).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
-    });
-  } catch {
-    // Fallback: call lookAt with force=true which sets entity.yaw/pitch AND lastSentYaw/lastSentPitch
-    // without awaiting the lookingTask (force=true returns immediately)
-    try { (b as any).lookAt(pos, true); } catch (_) { /* ignore */ }
-  }
+  // Directly set entity.yaw/pitch in radians.
+  // Do NOT call b.lookAt() - with force=true it sets lastSentYaw=target,
+  // making physics tick see delta=0 and NOT send a look packet.
+  // By only setting entity.yaw/pitch, the next physics tick (within 50ms)
+  // will detect the delta and send the correct look to the server.
+  const eye = b.entity.position.offset(0, b.entity.eyeHeight || 1.62, 0);
+  const dx = pos.x - eye.x;
+  const dy = pos.y - eye.y;
+  const dz = pos.z - eye.z;
+  b.entity.yaw = Math.atan2(-dx, -dz);
+  b.entity.pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
+  // Give physics tick time to send the look packet
+  await new Promise(r => setTimeout(r, 100));
 }
 
 // --- Tool Registration ---
@@ -773,11 +776,19 @@ registerTool(
     // Helper: set look direction properly.
     // bot.lookAt(pos, true) with force=true:
     //   - calculates yaw/pitch in radians
-    //   - sets entity.yaw/pitch
-    //   - sets lastSentYaw/lastSentPitch (so next physics tick sends correct direction immediately)
-    //   - returns immediately (no await on lookingTask.promise)
+    //   - sets entity.yaw/pitch (in radians)
+    //   - does NOT touch lastSentYaw/lastSentPitch (so next physics tick detects delta and sends look packet)
+    //   - bot.lookAt(pos, true) is BROKEN: force=true sets lastSentYaw=target, making physics tick see delta=0
     function setLookImmediate(pos: Vec3) {
-      try { (bot as any).lookAt(pos, true); } catch (_) { /* ignore */ }
+      const eye = bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0);
+      const dx = pos.x - eye.x;
+      const dy = pos.y - eye.y;
+      const dz = pos.z - eye.z;
+      const yaw = Math.atan2(-dx, -dz);
+      const pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
+      bot.entity.yaw = yaw;
+      bot.entity.pitch = pitch;
+      // Do NOT call bot.look() - it would set lastSentYaw=pitch, preventing the look packet from being sent
     }
 
     for (const fd of faceDirs) {
@@ -794,8 +805,8 @@ registerTool(
       // Set look direction to the face center (fire-and-forget)
       const lookTarget = new Vec3(refX + 0.5, refY + 0.5, refZ + 0.5);
       setLookImmediate(lookTarget);
-      // Wait for server to process look packet
-      await new Promise(r => setTimeout(r, 200));
+      // Wait for physics tick to send look packet (50ms tick) + server processing (200ms buffer)
+      await new Promise(r => setTimeout(r, 300));
 
       // Use mineflayer's _genericPlace with forceLook:'ignore' to skip the hanging lookAt
       // This handles all protocol details (direction, cursor, sequence, worldBorderHit, etc.)
@@ -831,6 +842,117 @@ registerTool(
     }
 
     return { error: 'Failed to place block. No valid reference found or placement was rejected by server. Check that target is air and you have the item in hand.' };
+  },
+);
+
+registerTool(
+  'debug_place',
+  {
+    name: 'debug_place',
+    description: 'Debug: diagnose block placement issues. Tests different placement methods and reports detailed state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: 'Target X' },
+        y: { type: 'number', description: 'Target Y' },
+        z: { type: 'number', description: 'Target Z' },
+      },
+      required: ['x', 'y', 'z'],
+    },
+  },
+  async (args) => {
+    if (!bot) return { error: 'Not connected' };
+    const x = Math.floor(Number(args.x));
+    const y = Math.floor(Number(args.y));
+    const z = Math.floor(Number(args.z));
+    const results: Record<string, unknown> = {};
+
+    // 1. Current state
+    results.botPos = bot.entity.position;
+    results.heldItem = bot.heldItem ? { name: bot.heldItem.name, count: bot.heldItem.count } : null;
+    results.selectedSlot = bot.inventory.selectedSlot;
+    results.quickBarSlot = bot.quickBarSlot;
+    const hotbar = [];
+    for (let s = 36; s < 45; s++) {
+      const item = bot.inventory.slots[s];
+      hotbar.push(item ? { slot: s - 36, name: item.name, count: item.count } : null);
+    }
+    results.hotbar = hotbar;
+
+    // 2. Target block
+    const target = bot.blockAt(new Vec3(x, y, z));
+    results.targetBlock = target?.name || 'null';
+
+    // 3. Try to find a reference and test placement
+    const faceDirs = [
+      { dx: 0, dy: -1, dz: 0, fv: [0, 1, 0], label: 'above_ref_below' },
+      { dx: 0, dy: 0, dz: -1, fv: [0, 0, 1], label: 'south_of_ref_north' },
+      { dx: 0, dy: 0, dz: 1, fv: [0, 0, -1], label: 'north_of_ref_south' },
+      { dx: -1, dy: 0, dz: 0, fv: [1, 0, 0], label: 'east_of_ref_west' },
+      { dx: 1, dy: 0, dz: 0, fv: [-1, 0, 0], label: 'west_of_ref_east' },
+    ];
+
+    for (const fd of faceDirs) {
+      const refX = x + fd.dx, refY = y + fd.dy, refZ = z + fd.dz;
+      const neighbor = bot.blockAt(new Vec3(refX, refY, refZ));
+      if (!neighbor || neighbor.name === 'air' || neighbor.name === 'cave_air') continue;
+
+      const dist = bot.entity.position.distanceTo(neighbor.position);
+      const canSee = bot.canSeeBlock(neighbor);
+
+      results[`ref_${fd.label}`] = {
+        name: neighbor.name,
+        pos: { x: refX, y: refY, z: refZ },
+        distance: Math.round(dist * 100) / 100,
+        canSee: canSee,
+      };
+
+      if (!canSee) continue;
+
+      // Try method 1: bot.activateBlock (sends use_on packet)
+      try {
+        console.error(`[debug_place] Trying activateBlock on ${neighbor.name} at ${refX},${refY},${refZ}`);
+        await bot.activateBlock(neighbor);
+        await new Promise(r => setTimeout(r, 500));
+        const afterActivate = bot.blockAt(new Vec3(x, y, z));
+        results[`activateBlock_${fd.label}`] = {
+          result: 'called successfully',
+          targetAfter: afterActivate?.name || 'air',
+        };
+        if (afterActivate && afterActivate.name !== 'air' && afterActivate.name !== target?.name) {
+          results.success = 'activateBlock worked!';
+          return results;
+        }
+      } catch (e: any) {
+        results[`activateBlock_${fd.label}`] = { error: e.message };
+      }
+
+      // Try method 2: bot.placeBlock (standard API with timeout)
+      try {
+        const faceVec = new Vec3(fd.fv[0], fd.fv[1], fd.fv[2]);
+        console.error(`[debug_place] Trying bot.placeBlock on ${neighbor.name} at ${refX},${refY},${refZ} face=${faceVec}`);
+        await Promise.race([
+          bot.placeBlock(neighbor, faceVec),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('placeBlock timeout 6s')), 6000)),
+        ]);
+        await new Promise(r => setTimeout(r, 500));
+        const afterPlace = bot.blockAt(new Vec3(x, y, z));
+        results[`placeBlock_${fd.label}`] = {
+          result: 'placeBlock resolved',
+          targetAfter: afterPlace?.name || 'air',
+        };
+        if (afterPlace && afterPlace.name !== 'air' && afterPlace.name !== target?.name) {
+          results.success = 'placeBlock worked!';
+          return results;
+        }
+      } catch (e: any) {
+        results[`placeBlock_${fd.label}`] = { error: e.message };
+      }
+
+      break; // Only try the first valid reference
+    }
+
+    return results;
   },
 );
 
