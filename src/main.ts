@@ -87,17 +87,9 @@ async function safeLookAt(b: Bot | null, pos: Vec3, force: boolean = true): Prom
       b!.lookAt(pos, force).then(() => { clearTimeout(timer); resolve(); }).catch((e) => { clearTimeout(timer); reject(e); });
     });
   } catch {
-    // Fallback: set yaw/pitch directly using prismarine's lookAt math
-    const { position } = b.entity!;
-    const dx = pos.x - position.x;
-    const dy = pos.y - position.y;
-    const dz = pos.z - position.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    const yaw = Math.atan2(dx, dz) * (180 / Math.PI) + 180;
-    const pitch = -Math.atan2(dy, dist) * (180 / Math.PI);
-    (b.entity as any).yaw = yaw;
-    (b.entity as any).pitch = pitch;
-    b.lookAt(pos, force); // fire and forget (no await)
+    // Fallback: call lookAt with force=true which sets entity.yaw/pitch AND lastSentYaw/lastSentPitch
+    // without awaiting the lookingTask (force=true returns immediately)
+    try { (b as any).lookAt(pos, true); } catch (_) { /* ignore */ }
   }
 }
 
@@ -777,19 +769,14 @@ registerTool(
       { dx: 1, dy: 0, dz: 0, fv: new Vec3(-1, 0, 0) },   // ref east of target → place west of ref
     ];
 
-    // Helper: set look direction WITHOUT waiting for 'look' event (which hangs)
+    // Helper: set look direction properly.
+    // bot.lookAt(pos, true) with force=true:
+    //   - calculates yaw/pitch in radians
+    //   - sets entity.yaw/pitch
+    //   - sets lastSentYaw/lastSentPitch (so next physics tick sends correct direction immediately)
+    //   - returns immediately (no await on lookingTask.promise)
     function setLookImmediate(pos: Vec3) {
-      const { position } = bot!.entity!;
-      const dx = pos.x - position.x;
-      const dy = pos.y - position.y;
-      const dz = pos.z - position.z;
-      const distXZ = Math.sqrt(dx * dx + dz * dz);
-      const yaw = Math.atan2(-dx, -dz) * (180 / Math.PI);
-      const pitch = -Math.atan2(dy, distXZ) * (180 / Math.PI);
-      (bot!.entity as any).yaw = yaw;
-      (bot!.entity as any).pitch = pitch;
-      // Fire-and-forget: sends the look packet, ignore the promise
-      try { bot!.lookAt(pos, true); } catch (_) { /* ignore */ }
+      try { (bot as any).lookAt(pos, true); } catch (_) { /* ignore */ }
     }
 
     for (const fd of faceDirs) {
