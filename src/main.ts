@@ -1673,6 +1673,95 @@ registerTool(
   },
 );
 
+// --- jump tool ---
+registerTool(
+  'jump',
+  {
+    name: 'jump',
+    description: '让bot跳跃。可用于脱困、跳过障碍、或配合walk_toward走出困境。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  async () => {
+    if (!bot) return { error: 'Not connected' };
+    if (!bot.entity) return { error: 'Bot entity not ready' };
+    (bot as any).setControlState('jump', true);
+    await new Promise(r => setTimeout(r, 100));
+    (bot as any).setControlState('jump', false);
+    await new Promise(r => setTimeout(r, 500));
+    return { success: true, position: bot.entity.position, onGround: bot.entity.onGround };
+  },
+);
+
+// --- stuck_check tool ---
+registerTool(
+  'stuck_check',
+  {
+    name: 'stuck_check',
+    description: '诊断bot是否卡住：检查脚下方块、周围地形、是否能移动。如果卡住，自动尝试挖掉脚下方块让bot掉落。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  async () => {
+    if (!bot) return { error: 'Not connected' };
+    if (!bot.entity) return { error: 'Bot entity not ready' };
+
+    const pos = bot.entity.position;
+    const px = Math.floor(pos.x), py = Math.floor(pos.y), pz = Math.floor(pos.z);
+    const footY = py - 1;
+
+    const footBlock = bot.blockAt(new Vec3(px, footY, pz));
+    const belowFoot = bot.blockAt(new Vec3(px, footY - 1, pz));
+
+    // Check if we're in a tree (leaves around)
+    let leafCount = 0;
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dz = -2; dz <= 2; dz++) {
+        const b = bot.blockAt(new Vec3(px + dx, footY, pz + dz));
+        if (b && b.name.includes('leaves')) leafCount++;
+      }
+    }
+
+    const inTree = leafCount > 3;
+    const stuck = !bot.entity.onGround && footY > 65; // in air above ground = falling, or on a block
+
+    // Try to dig under if stuck on leaves
+    let dug = false;
+    let digResult = '';
+    if (inTree && footBlock && footBlock.name.includes('leaves')) {
+      try {
+        await safeLookAt(bot, new Vec3(px, footY, pz), true);
+        await bot.dig(footBlock, true);
+        dug = true;
+        digResult = `Dug ${footBlock.name} at (${px}, ${footY}, ${pz})`;
+        // Wait for fall
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e: any) {
+        digResult = `Dig failed: ${e.message}`;
+      }
+    }
+
+    const newPos = bot.entity.position;
+    const fell = Math.abs(newPos.y - pos.y) > 1;
+
+    return {
+      originalPosition: { x: px, y: py, z: pz },
+      currentPosition: { x: Math.floor(newPos.x), y: Math.floor(newPos.y), z: Math.floor(newPos.z) },
+      onGround: bot.entity.onGround,
+      footBlock: footBlock?.name || 'air',
+      belowFoot: belowFoot?.name || 'air',
+      inTree,
+      leafCount,
+      dug,
+      digResult,
+      fell,
+      suggestion: fell
+        ? 'Bot fell successfully! Check new position.'
+        : (inTree
+          ? 'Still stuck in tree. Try breaking more blocks below or restart MCP.'
+          : 'Bot appears to be on solid ground. No action needed.'),
+    };
+  },
+);
+
 async function main() {
   bot = createBot();
 
